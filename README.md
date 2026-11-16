@@ -4,9 +4,9 @@ A modern, widget-first Android RSS/Atom feed reader built in **Kotlin**, inspire
 
 ## Screenshots
 
-| Home Screen Widget | Configure Widget | Companion App |
-| :---: | :---: | :---: |
-| <img src="docs/screenshots/widget-home.png" width="260" alt="Klaatu Home Screen Widget" /> | <img src="docs/screenshots/widget-config.png" width="260" alt="Klaatu Widget Configuration" /> | <img src="docs/screenshots/app-main.png" width="260" alt="Klaatu Companion App" /> |
+| Home Screen Widget | In-App Feed Reader | Configure Widget | Manage & OPML |
+| :---: | :---: | :---: | :---: |
+| <img src="docs/screenshots/widget-home.png" width="210" alt="Klaatu Home Screen Widget" /> | <img src="docs/screenshots/app-feed.png" width="210" alt="Klaatu In-App Feed Reader" /> | <img src="docs/screenshots/widget-config.png" width="210" alt="Klaatu Widget Configuration" /> | <img src="docs/screenshots/app-main.png" width="210" alt="Klaatu Manage Tab" /> |
 
 ## Features
 - **Scrollable Home Screen Widget** (Jetpack Glance):
@@ -18,10 +18,11 @@ A modern, widget-first Android RSS/Atom feed reader built in **Kotlin**, inspire
   - **Light / Dark & Header Styles**: Supports **Follow Device**, **Light**, and **Dark** appearance modes, plus **Vibrant** and **Soft Pastel** light header styles.
 - **OPML Support**: Import and export feed subscriptions and folders/categories via standard OPML 2.0 XML ([OpmlCodec](app/src/main/java/com/klaatu/rss/data/opml/OpmlCodec.kt)), with case-insensitive attribute handling and folder updates on re-import.
 - **RSS 2.0 & Atom Sync**: Parallel feed fetching (`Semaphore(8)`) with automatic `http://` → `https://` URL upgrades, Room caching, and Coil thumbnail loading.
-- **In-App RSS Reader** (Jetpack Compose + Material 3):
+- **In-App RSS Reader** (Jetpack Compose + Material 3, with OS Light/Dark & Material You Dynamic Color via [KlaatuTheme](app/src/main/java/com/klaatu/rss/ui/theme/KlaatuTheme.kt)):
   - **Feed** tab: browse stories with thumbnails, filter by OPML folder, pull-to-refresh, and tap any story to open it in your default browser.
   - **Manage** tab: import/export OPML, configure background refresh frequency (`15m`, `30m`, `1h`, `3h`, `6h`, `Manual`), view/configure placed widgets, and manage individual feeds.
 - **Adaptive & Monochrome App Icon**: Gort-inspired black-and-white vector icon with Material You themed-icon support.
+- **CI & Releases**: GitHub Actions workflow ([release.yml](.github/workflows/release.yml)) runs unit tests on every push/PR and builds & publishes signed APKs on `v*` tags.
 
 ## Tech Stack
 - **Language**: Kotlin (`2.0.21`)

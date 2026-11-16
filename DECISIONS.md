@@ -47,3 +47,15 @@
 - **Status**: Accepted
 - **Decision**: Key `WidgetPreferences` by `appWidgetId` and provide `WidgetConfigActivity` (`ACTION_APPWIDGET_CONFIGURE` + `reconfigurable` widget feature) so each widget instance independently selects its OPML folders, individual feeds, custom label, and theme.
 - **Rationale**: Allows users with large, grouped OPML files to place multiple specialized widgets on their home screen (e.g., *Android + Linux* on one widget, *Finance* on another) and reconfigure each directly from its gear icon.
+
+## ADR-009: Two-Tab In-App Reader & OS Dynamic Theming
+- **Date**: 2026-11-16
+- **Status**: Accepted
+- **Decision**: Structure `MainActivity` with **Feed** and **Manage** bottom-navigation tabs wrapped in `KlaatuTheme` (OS Light/Dark + Material You dynamic colors on Android 12+).
+- **Rationale**: Lets users browse stories, filter by OPML folder, and open articles directly inside the app while keeping OPML and widget management cleanly separated.
+
+## ADR-010: GitHub Actions CI & Signed APK Releases
+- **Date**: 2026-11-16
+- **Status**: Accepted
+- **Decision**: Use `.github/workflows/release.yml` to run `testDebugUnitTest` and `assembleRelease` on pushes/PRs, signing APKs from repository secrets and publishing GitHub Releases on `v*` tags.
+- **Rationale**: Automates verification and APK distribution without storing release keystores in the repository.
