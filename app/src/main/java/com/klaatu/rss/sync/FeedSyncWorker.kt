@@ -32,6 +32,9 @@ class FeedSyncWorker(
                 repo.syncAllFeeds()
             }
             Log.d("KlaatuSync", "FeedSyncWorker finished, synced=$synced")
+            withTimeoutOrNull(10_000L) {
+                repo.prefetchRecentThumbnails()
+            }
         } finally {
             WidgetPreferences.clearAllRefreshing(applicationContext)
             KlaatuWidget().updateAll(applicationContext)

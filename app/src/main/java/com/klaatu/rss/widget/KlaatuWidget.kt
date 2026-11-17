@@ -53,6 +53,7 @@ import coil.request.SuccessResult
 import com.klaatu.rss.R
 import com.klaatu.rss.data.FeedRepository
 import com.klaatu.rss.sync.FeedSyncWorker
+import com.klaatu.rss.sync.ThumbnailPrefetchWorker
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -91,11 +92,20 @@ class KlaatuWidget : GlanceAppWidget() {
 
         val totalCount = repo.getWidgetArticleCount(config.categories, config.feedIds)
         val rawArticles = repo.getWidgetArticles(config.categories, config.feedIds, limit = 30)
-        val thumbnails = loadThumbnails(
+        val thumbnails = loadCachedThumbnails(
             context = context,
             items = rawArticles.map { it.id to it.imageUrl },
-            cacheOnly = isRefreshing,
         )
+
+        if (!isRefreshing) {
+            val missingUrls = rawArticles.take(25)
+                .filter { it.id !in thumbnails && !it.imageUrl.isNullOrBlank() }
+                .mapNotNull { it.imageUrl }
+                .distinct()
+            if (missingUrls.isNotEmpty()) {
+                ThumbnailPrefetchWorker.enqueue(context, missingUrls)
+            }
+        }
 
         val uiArticles = if (rawArticles.isEmpty()) {
             listOf(
@@ -143,36 +153,39 @@ class KlaatuWidget : GlanceAppWidget() {
         }
     }
 
-    private suspend fun loadThumbnails(
+    /**
+     * Reads already-cached thumbnails from Coil's memory/disk cache without network I/O
+     * so widget updates (config saves, refresh spinner toggles) complete immediately and
+     * never discard existing thumbnails.
+     */
+    private suspend fun loadCachedThumbnails(
         context: Context,
         items: List<Pair<Long, String?>>,
-        cacheOnly: Boolean,
-    ): Map<Long, Bitmap> = withTimeoutOrNull(if (cacheOnly) 500L else 3_000L) {
-        coroutineScope {
-            val imageLoader = context.imageLoader
-            items.take(25)
-                .filter { !it.second.isNullOrBlank() }
-                .map { (id, url) ->
-                    async {
-                        val bitmap = runCatching {
-                            val builder = ImageRequest.Builder(context)
+    ): Map<Long, Bitmap> = coroutineScope {
+        val imageLoader = context.imageLoader
+        items.take(25)
+            .filter { !it.second.isNullOrBlank() }
+            .map { (id, url) ->
+                async {
+                    val bitmap = withTimeoutOrNull(800L) {
+                        runCatching {
+                            val request = ImageRequest.Builder(context)
                                 .data(url)
                                 .size(264, 180)
                                 .allowHardware(false)
-                            if (cacheOnly) {
-                                builder.networkCachePolicy(CachePolicy.DISABLED)
-                            }
-                            val result = imageLoader.execute(builder.build()) as? SuccessResult
+                                .networkCachePolicy(CachePolicy.DISABLED)
+                                .build()
+                            val result = imageLoader.execute(request) as? SuccessResult
                             (result?.drawable as? BitmapDrawable)?.bitmap
                         }.getOrNull()
-                        if (bitmap != null) id to bitmap else null
                     }
+                    if (bitmap != null) id to bitmap else null
                 }
-                .awaitAll()
-                .filterNotNull()
-                .toMap()
-        }
-    }.orEmpty()
+            }
+            .awaitAll()
+            .filterNotNull()
+            .toMap()
+    }
 
     private fun formatRelativeTime(publishedAt: Long): String {
         if (publishedAt <= 0L) return ""

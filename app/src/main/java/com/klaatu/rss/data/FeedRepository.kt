@@ -1,6 +1,10 @@
 package com.klaatu.rss.data
 
 import android.content.Context
+import coil.imageLoader
+import coil.request.CachePolicy
+import coil.request.ImageRequest
+import coil.request.SuccessResult
 import com.klaatu.rss.data.db.ArticleEntity
 import com.klaatu.rss.data.db.ArticleWithFeed
 import com.klaatu.rss.data.db.FeedEntity
@@ -16,6 +20,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.InputStream
@@ -24,7 +29,8 @@ import java.util.concurrent.atomic.AtomicInteger
 
 class FeedRepository(context: Context) {
 
-    private val dao = KlaatuDatabase.getInstance(context).dao()
+    private val appContext = context.applicationContext
+    private val dao = KlaatuDatabase.getInstance(appContext).dao()
     private val httpClient = OkHttpClient.Builder()
         .connectTimeout(8, TimeUnit.SECONDS)
         .readTimeout(10, TimeUnit.SECONDS)
@@ -94,6 +100,14 @@ class FeedRepository(context: Context) {
         dao.deleteFeed(feedId)
     }
 
+    suspend fun deleteFeedsByCategory(category: String) = withContext(Dispatchers.IO) {
+        dao.deleteFeedsByCategory(category)
+    }
+
+    suspend fun deleteBrokenFeeds() = withContext(Dispatchers.IO) {
+        dao.deleteBrokenFeeds()
+    }
+
     suspend fun syncAllFeeds(): Int = withContext(Dispatchers.IO) {
         val feeds = dao.getAllFeeds()
         if (feeds.isEmpty()) return@withContext 0
@@ -104,20 +118,33 @@ class FeedRepository(context: Context) {
             feeds.map { feed ->
                 async {
                     semaphore.withPermit {
-                        runCatching {
+                        val result = runCatching {
                             val initialUrl = if (feed.xmlUrl.startsWith("http://", ignoreCase = true)) {
                                 "https://" + feed.xmlUrl.substring(7)
                             } else {
                                 feed.xmlUrl
                             }
-                            val response = executeFeedRequest(initialUrl)
-                                ?: if (initialUrl != feed.xmlUrl) executeFeedRequest(feed.xmlUrl) else null
-                            response?.use { res ->
-                                val bodyStream = res.body?.byteStream() ?: return@use
-                                val finalUrl = res.request.url.toString()
+                            val firstAttempt = executeFeedRequest(initialUrl)
+                            val attempt = if (firstAttempt.response == null && initialUrl != feed.xmlUrl) {
+                                executeFeedRequest(feed.xmlUrl)
+                            } else {
+                                firstAttempt
+                            }
+                            val res = attempt.response
+                            if (res == null) {
+                                dao.updateFeedError(feed.id, attempt.error ?: "Sync failed")
+                                return@runCatching
+                            }
+                            res.use { okRes ->
+                                val bodyStream = okRes.body?.byteStream()
+                                if (bodyStream == null) {
+                                    dao.updateFeedError(feed.id, "Empty response")
+                                    return@use
+                                }
+                                val finalUrl = okRes.request.url.toString()
                                 val upgradedUrl = when {
                                     finalUrl.startsWith("https://", ignoreCase = true) -> finalUrl
-                                    initialUrl != feed.xmlUrl && res.request.url.isHttps -> initialUrl
+                                    initialUrl != feed.xmlUrl && okRes.request.url.isHttps -> initialUrl
                                     else -> null
                                 }
                                 if (upgradedUrl != null && upgradedUrl != feed.xmlUrl) {
@@ -145,6 +172,9 @@ class FeedRepository(context: Context) {
                                 syncedCount.incrementAndGet()
                             }
                         }
+                        result.onFailure { err ->
+                            dao.updateFeedError(feed.id, err.message?.take(60) ?: err.javaClass.simpleName)
+                        }
                     }
                 }
             }.awaitAll()
@@ -152,19 +182,28 @@ class FeedRepository(context: Context) {
         syncedCount.get()
     }
 
-    private fun executeFeedRequest(url: String): okhttp3.Response? = runCatching {
+    private data class FeedFetchAttempt(
+        val response: okhttp3.Response?,
+        val error: String?,
+    )
+
+    private fun executeFeedRequest(url: String): FeedFetchAttempt = try {
         val request = Request.Builder()
             .url(url)
             .header("User-Agent", "KlaatuRSS/0.1 (Android)")
             .build()
         val response = httpClient.newCall(request).execute()
         if (response.isSuccessful) {
-            response
+            FeedFetchAttempt(response = response, error = null)
         } else {
+            val code = response.code
             response.close()
-            null
+            FeedFetchAttempt(response = null, error = "HTTP $code")
         }
-    }.getOrNull()
+    } catch (e: Exception) {
+        val reason = e.javaClass.simpleName.removeSuffix("Exception").ifBlank { "Network error" }
+        FeedFetchAttempt(response = null, error = reason)
+    }
 
     suspend fun getWidgetArticles(
         categories: Set<String>,
@@ -190,5 +229,54 @@ class FeedRepository(context: Context) {
             categories = categories.ifEmpty { setOf("") }.toList(),
             feedIds = feedIds.ifEmpty { setOf(-1L) }.toList(),
         )
+    }
+
+    /**
+     * Prefetches thumbnails for the most recent articles into Coil's disk cache so
+     * widget updates can render images immediately without blocking on the network.
+     */
+    suspend fun prefetchRecentThumbnails(limit: Int = 30): Int = withContext(Dispatchers.IO) {
+        val urls = dao.getRecentImageUrls(limit)
+        prefetchThumbnails(urls)
+    }
+
+    /**
+     * Downloads and caches the given image URLs at widget thumbnail dimensions.
+     * Returns the number of URLs that resolved successfully.
+     */
+    suspend fun prefetchThumbnails(urls: List<String>): Int = withContext(Dispatchers.IO) {
+        val distinctUrls = urls.asSequence()
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+            .take(30)
+            .toList()
+        if (distinctUrls.isEmpty()) return@withContext 0
+
+        val imageLoader = appContext.imageLoader
+        val semaphore = Semaphore(6)
+        val cachedCount = AtomicInteger(0)
+
+        coroutineScope {
+            distinctUrls.map { url ->
+                async {
+                    semaphore.withPermit {
+                        val succeeded = withTimeoutOrNull(4_000L) {
+                            runCatching {
+                                val request = ImageRequest.Builder(appContext)
+                                    .data(url)
+                                    .size(264, 180)
+                                    .allowHardware(false)
+                                    .memoryCachePolicy(CachePolicy.DISABLED)
+                                    .build()
+                                imageLoader.execute(request) is SuccessResult
+                            }.getOrDefault(false)
+                        } == true
+                        if (succeeded) cachedCount.incrementAndGet()
+                    }
+                }
+            }.awaitAll()
+        }
+        cachedCount.get()
     }
 }

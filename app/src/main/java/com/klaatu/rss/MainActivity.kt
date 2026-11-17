@@ -35,6 +35,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.CreateNewFolder
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.KeyboardArrowDown
@@ -45,13 +46,17 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.Upload
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExposedDropdownMenuBox
+import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.MenuAnchorType
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedButton
@@ -87,6 +92,7 @@ import coil.compose.AsyncImage
 import com.klaatu.rss.data.FeedRepository
 import com.klaatu.rss.data.db.ArticleWithFeed
 import com.klaatu.rss.data.db.FeedEntity
+import com.klaatu.rss.data.opml.OpmlFeed
 import com.klaatu.rss.sync.FeedSyncWorker
 import com.klaatu.rss.ui.theme.KlaatuTheme
 import com.klaatu.rss.widget.KlaatuWidget
@@ -150,6 +156,14 @@ private fun KlaatuCompanionScreen() {
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
+    val prefetchAndRefreshWidget: () -> Unit = {
+        scope.launch {
+            if (repo.prefetchRecentThumbnails() > 0) {
+                KlaatuWidget().updateAll(context)
+            }
+        }
+    }
+
     val triggerSync: () -> Unit = {
         if (!isSyncing) {
             scope.launch {
@@ -157,6 +171,7 @@ private fun KlaatuCompanionScreen() {
                 val synced = repo.syncAllFeeds()
                 KlaatuWidget().updateAll(context)
                 isSyncing = false
+                prefetchAndRefreshWidget()
                 snackbarHostState.showSnackbar("Synced $synced feeds")
             }
         }
@@ -174,6 +189,7 @@ private fun KlaatuCompanionScreen() {
             repo.syncAllFeeds()
             KlaatuWidget().updateAll(context)
             isSyncing = false
+            prefetchAndRefreshWidget()
             snackbarHostState.showSnackbar("Imported $imported feeds")
         }
     }
@@ -284,6 +300,20 @@ private fun KlaatuCompanionScreen() {
                             KlaatuWidget().updateAll(context)
                         }
                     },
+                    onDeleteCategory = { category ->
+                        scope.launch {
+                            repo.deleteFeedsByCategory(category)
+                            KlaatuWidget().updateAll(context)
+                            snackbarHostState.showSnackbar("Removed feeds in $category")
+                        }
+                    },
+                    onDeleteBroken = {
+                        scope.launch {
+                            repo.deleteBrokenFeeds()
+                            KlaatuWidget().updateAll(context)
+                            snackbarHostState.showSnackbar("Removed broken feeds")
+                        }
+                    },
                 )
             }
         }
@@ -291,6 +321,7 @@ private fun KlaatuCompanionScreen() {
 
     if (showAddFeedDialog) {
         AddFeedDialog(
+            existingCategories = categories,
             onDismiss = { showAddFeedDialog = false },
             onAdd = { url, category ->
                 showAddFeedDialog = false
@@ -301,6 +332,7 @@ private fun KlaatuCompanionScreen() {
                         repo.syncAllFeeds()
                         KlaatuWidget().updateAll(context)
                         isSyncing = false
+                        prefetchAndRefreshWidget()
                         snackbarHostState.showSnackbar("Feed added")
                     } else {
                         snackbarHostState.showSnackbar("Feed already exists or URL is invalid")
@@ -486,7 +518,33 @@ private fun ManageTab(
     onSelectRefreshMinutes: (Long) -> Unit,
     onOpenWidgetConfig: (Int) -> Unit,
     onDeleteFeed: (Long) -> Unit,
+    onDeleteCategory: (String) -> Unit,
+    onDeleteBroken: () -> Unit,
 ) {
+    var selectedCategory by remember { mutableStateOf<String?>(null) }
+    var showBrokenOnly by remember { mutableStateOf(false) }
+    var categoryPendingDelete by remember { mutableStateOf<String?>(null) }
+    var confirmDeleteBroken by remember { mutableStateOf(false) }
+
+    val categoryCounts = remember(feeds) {
+        feeds.groupingBy { it.category }.eachCount()
+    }
+    val brokenCount = remember(feeds) {
+        feeds.count { it.lastError.isNotEmpty() }
+    }
+    val sortedCategories = remember(categoryCounts) {
+        categoryCounts.keys.sorted()
+    }
+    val activeBrokenFilter = showBrokenOnly && brokenCount > 0
+    val activeCategory = if (activeBrokenFilter) null else selectedCategory?.takeIf { it in categoryCounts }
+    val filteredFeeds = remember(feeds, activeCategory, activeBrokenFilter) {
+        when {
+            activeBrokenFilter -> feeds.filter { it.lastError.isNotEmpty() }
+            activeCategory != null -> feeds.filter { it.category == activeCategory }
+            else -> feeds
+        }
+    }
+
     LazyColumn(
         modifier = modifier
             .fillMaxSize()
@@ -583,7 +641,87 @@ private fun ManageTab(
                 )
             }
         } else if (isSubscriptionsExpanded) {
-            items(feeds, key = { it.id }) { feed ->
+            item {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    FilterChip(
+                        selected = !activeBrokenFilter && activeCategory == null,
+                        onClick = {
+                            showBrokenOnly = false
+                            selectedCategory = null
+                        },
+                        label = { Text("All (${feeds.size})") },
+                    )
+                    if (brokenCount > 0) {
+                        FilterChip(
+                            selected = activeBrokenFilter,
+                            onClick = {
+                                showBrokenOnly = !activeBrokenFilter
+                                if (showBrokenOnly) selectedCategory = null
+                            },
+                            label = { Text("Broken ($brokenCount)") },
+                        )
+                    }
+                    sortedCategories.forEach { category ->
+                        FilterChip(
+                            selected = !activeBrokenFilter && activeCategory == category,
+                            onClick = {
+                                showBrokenOnly = false
+                                selectedCategory = if (activeCategory == category) null else category
+                            },
+                            label = { Text("$category (${categoryCounts[category] ?: 0})") },
+                        )
+                    }
+                }
+            }
+
+            if (activeBrokenFilter) {
+                item {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = "$brokenCount broken feed(s)",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error,
+                            modifier = Modifier.weight(1f),
+                        )
+                        TextButton(onClick = { confirmDeleteBroken = true }) {
+                            Text(
+                                text = "Delete all broken",
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                        }
+                    }
+                }
+            } else if (activeCategory != null) {
+                item {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = "${filteredFeeds.size} feed(s) in $activeCategory",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.weight(1f),
+                        )
+                        TextButton(onClick = { categoryPendingDelete = activeCategory }) {
+                            Text(
+                                text = "Delete folder",
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                        }
+                    }
+                }
+            }
+
+            items(filteredFeeds, key = { it.id }) { feed ->
                 FeedRow(
                     feed = feed,
                     onDelete = { onDeleteFeed(feed.id) },
@@ -592,6 +730,60 @@ private fun ManageTab(
         }
 
         item { Spacer(Modifier.height(72.dp)) }
+    }
+
+    val pendingDelete = categoryPendingDelete
+    if (pendingDelete != null) {
+        val count = categoryCounts[pendingDelete] ?: 0
+        AlertDialog(
+            onDismissRequest = { categoryPendingDelete = null },
+            title = { Text("Delete folder feeds?") },
+            text = {
+                Text("Remove all $count feed(s) in \"$pendingDelete\" and their cached articles?")
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        categoryPendingDelete = null
+                        selectedCategory = null
+                        onDeleteCategory(pendingDelete)
+                    },
+                ) {
+                    Text("Delete", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { categoryPendingDelete = null }) {
+                    Text("Cancel")
+                }
+            },
+        )
+    }
+
+    if (confirmDeleteBroken) {
+        AlertDialog(
+            onDismissRequest = { confirmDeleteBroken = false },
+            title = { Text("Delete broken feeds?") },
+            text = {
+                Text("Remove all $brokenCount feed(s) that failed their last sync?")
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        confirmDeleteBroken = false
+                        showBrokenOnly = false
+                        onDeleteBroken()
+                    },
+                ) {
+                    Text("Delete", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmDeleteBroken = false }) {
+                    Text("Cancel")
+                }
+            },
+        )
     }
 }
 
@@ -727,6 +919,15 @@ private fun FeedRow(
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
+            if (feed.lastError.isNotEmpty()) {
+                Text(
+                    text = "Failed: ${feed.lastError}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.error,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
         }
         IconButton(onClick = onDelete) {
             Icon(
@@ -738,39 +939,108 @@ private fun FeedRow(
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun AddFeedDialog(
+    existingCategories: List<String>,
     onDismiss: () -> Unit,
     onAdd: (url: String, category: String) -> Unit,
 ) {
+    val folderOptions = remember(existingCategories) {
+        (existingCategories + OpmlFeed.DEFAULT_CATEGORY)
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+    }
+
     var url by remember { mutableStateOf("") }
-    var category by remember { mutableStateOf("") }
+    var dropdownExpanded by remember { mutableStateOf(false) }
+    var isCreatingNewFolder by remember { mutableStateOf(false) }
+    var selectedFolder by remember(folderOptions) { mutableStateOf(folderOptions.first()) }
+    var newFolderName by remember { mutableStateOf("") }
+
+    val resolvedCategory = if (isCreatingNewFolder) newFolderName.trim() else selectedFolder
+    val canSubmit = url.isNotBlank() && (!isCreatingNewFolder || newFolderName.isNotBlank())
 
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Add RSS / Atom Feed") },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 OutlinedTextField(
                     value = url,
                     onValueChange = { url = it },
                     label = { Text("Feed URL") },
                     placeholder = { Text("https://9to5linux.com/feed") },
                     singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
                 )
-                OutlinedTextField(
-                    value = category,
-                    onValueChange = { category = it },
-                    label = { Text("Folder / Category (optional)") },
-                    placeholder = { Text("Android + Linux") },
-                    singleLine = true,
-                )
+
+                ExposedDropdownMenuBox(
+                    expanded = dropdownExpanded,
+                    onExpandedChange = { dropdownExpanded = it },
+                ) {
+                    OutlinedTextField(
+                        value = if (isCreatingNewFolder) "New folder…" else selectedFolder,
+                        onValueChange = {},
+                        readOnly = true,
+                        label = { Text("Folder") },
+                        trailingIcon = {
+                            ExposedDropdownMenuDefaults.TrailingIcon(expanded = dropdownExpanded)
+                        },
+                        colors = ExposedDropdownMenuDefaults.outlinedTextFieldColors(),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .menuAnchor(MenuAnchorType.PrimaryNotEditable),
+                    )
+
+                    ExposedDropdownMenu(
+                        expanded = dropdownExpanded,
+                        onDismissRequest = { dropdownExpanded = false },
+                    ) {
+                        folderOptions.forEach { folder ->
+                            DropdownMenuItem(
+                                text = { Text(folder) },
+                                onClick = {
+                                    selectedFolder = folder
+                                    isCreatingNewFolder = false
+                                    dropdownExpanded = false
+                                },
+                            )
+                        }
+                        HorizontalDivider()
+                        DropdownMenuItem(
+                            leadingIcon = {
+                                Icon(
+                                    imageVector = Icons.Default.CreateNewFolder,
+                                    contentDescription = null,
+                                )
+                            },
+                            text = { Text("Create new folder…") },
+                            onClick = {
+                                isCreatingNewFolder = true
+                                dropdownExpanded = false
+                            },
+                        )
+                    }
+                }
+
+                if (isCreatingNewFolder) {
+                    OutlinedTextField(
+                        value = newFolderName,
+                        onValueChange = { newFolderName = it },
+                        label = { Text("New folder name") },
+                        placeholder = { Text("Android + Linux") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
             }
         },
         confirmButton = {
             TextButton(
-                enabled = url.isNotBlank(),
-                onClick = { onAdd(url, category) },
+                enabled = canSubmit,
+                onClick = { onAdd(url, resolvedCategory) },
             ) {
                 Text("Add")
             }

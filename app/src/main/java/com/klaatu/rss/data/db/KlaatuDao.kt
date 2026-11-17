@@ -21,8 +21,11 @@ interface KlaatuDao {
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertFeeds(feeds: List<FeedEntity>): List<Long>
 
-    @Query("UPDATE feeds SET title = :title, htmlUrl = :htmlUrl, lastFetchedAt = :fetchedAt WHERE id = :feedId")
+    @Query("UPDATE feeds SET title = :title, htmlUrl = :htmlUrl, lastFetchedAt = :fetchedAt, lastError = '' WHERE id = :feedId")
     suspend fun updateFeedMetadata(feedId: Long, title: String, htmlUrl: String, fetchedAt: Long)
+
+    @Query("UPDATE feeds SET lastError = :error WHERE id = :feedId")
+    suspend fun updateFeedError(feedId: Long, error: String)
 
     @Query("UPDATE feeds SET xmlUrl = :xmlUrl WHERE id = :feedId")
     suspend fun updateFeedUrl(feedId: Long, xmlUrl: String)
@@ -32,6 +35,12 @@ interface KlaatuDao {
 
     @Query("DELETE FROM feeds WHERE id = :feedId")
     suspend fun deleteFeed(feedId: Long)
+
+    @Query("DELETE FROM feeds WHERE category = :category")
+    suspend fun deleteFeedsByCategory(category: String)
+
+    @Query("DELETE FROM feeds WHERE lastError != ''")
+    suspend fun deleteBrokenFeeds()
 
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertArticles(articles: List<ArticleEntity>)
@@ -81,4 +90,15 @@ interface KlaatuDao {
 
     @Query("SELECT COUNT(*) FROM articles")
     fun observeTotalArticleCount(): Flow<Int>
+
+    @Query(
+        """
+        SELECT DISTINCT imageUrl
+        FROM articles
+        WHERE imageUrl IS NOT NULL AND imageUrl != ''
+        ORDER BY publishedAt DESC
+        LIMIT :limit
+        """
+    )
+    suspend fun getRecentImageUrls(limit: Int = 40): List<String>
 }

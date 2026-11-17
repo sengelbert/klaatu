@@ -16,6 +16,7 @@ data class FeedEntity(
     val htmlUrl: String = "",
     val category: String = "Uncategorized",
     val lastFetchedAt: Long = 0L,
+    val lastError: String = "",
 )
 
 @Entity(
