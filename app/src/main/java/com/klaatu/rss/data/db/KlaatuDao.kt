@@ -6,6 +6,11 @@ import androidx.room.OnConflictStrategy
 import androidx.room.Query
 import kotlinx.coroutines.flow.Flow
 
+data class FeedLatestArticle(
+    val feedId: Long,
+    val latestPublishedAt: Long,
+)
+
 @Dao
 interface KlaatuDao {
 
@@ -42,8 +47,17 @@ interface KlaatuDao {
     @Query("DELETE FROM feeds WHERE lastError != ''")
     suspend fun deleteBrokenFeeds()
 
+    @Query("DELETE FROM feeds WHERE id IN (:feedIds)")
+    suspend fun deleteFeedsByIds(feedIds: List<Long>)
+
+    @Query("SELECT feedId, MAX(publishedAt) AS latestPublishedAt FROM articles GROUP BY feedId")
+    fun observeFeedLatestArticleTimes(): Flow<List<FeedLatestArticle>>
+
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertArticles(articles: List<ArticleEntity>)
+
+    @Query("UPDATE articles SET imageUrl = :imageUrl WHERE id = :articleId")
+    suspend fun updateArticleImageUrl(articleId: Long, imageUrl: String)
 
     @Query(
         """

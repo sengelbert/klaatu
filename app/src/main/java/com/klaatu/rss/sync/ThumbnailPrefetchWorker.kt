@@ -10,10 +10,12 @@ import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
+import com.klaatu.rss.data.AuditLog
 import com.klaatu.rss.data.FeedRepository
 import com.klaatu.rss.widget.KlaatuWidget
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Fetches uncached widget thumbnail URLs in the background and refreshes widgets
@@ -26,14 +28,44 @@ class ThumbnailPrefetchWorker(
 
     override suspend fun doWork(): Result {
         val urls = inputData.getStringArray(KEY_URLS)?.toList().orEmpty()
-        if (urls.isEmpty()) return Result.success()
+        val articleIds = inputData.getLongArray(KEY_ARTICLE_IDS) ?: LongArray(0)
+        val articleLinks = inputData.getStringArray(KEY_ARTICLE_LINKS) ?: emptyArray()
+        val articlesToScrape = articleIds.indices
+            .take(articleLinks.size)
+            .map { i -> articleIds[i] to articleLinks[i] }
 
-        val cached = withTimeoutOrNull(12_000L) {
-            FeedRepository(applicationContext).prefetchThumbnails(urls)
-        } ?: 0
+        if (urls.isEmpty() && articlesToScrape.isEmpty()) return Result.success()
 
-        if (cached > 0) {
-            KlaatuWidget().updateAll(applicationContext)
+        val repo = FeedRepository(applicationContext)
+        val scrapedUrls = if (articlesToScrape.isNotEmpty()) {
+            withTimeoutOrNull(15_000L) {
+                repo.scrapeArticleImages(articlesToScrape)
+            }.orEmpty()
+        } else {
+            emptyList()
+        }
+
+        val allUrls = (urls + scrapedUrls).distinct()
+        val cachedCount = AtomicInteger(0)
+        if (allUrls.isNotEmpty()) {
+            withTimeoutOrNull(25_000L) {
+                repo.prefetchThumbnails(allUrls, cachedCount)
+            }
+        }
+
+        if (cachedCount.get() > 0 || scrapedUrls.isNotEmpty()) {
+            AuditLog.success(
+                applicationContext,
+                "THUMBS",
+                "Prefetch: scraped ${scrapedUrls.size}/${articlesToScrape.size}, cached ${cachedCount.get()}/${allUrls.size}",
+            )
+            KlaatuWidget.updateAllSequential(applicationContext)
+        } else {
+            AuditLog.info(
+                applicationContext,
+                "THUMBS",
+                "Prefetch: 0 new (urls=${urls.size}, scrape=${articlesToScrape.size})",
+            )
         }
         return Result.success()
     }
@@ -41,15 +73,21 @@ class ThumbnailPrefetchWorker(
     companion object {
         private const val WORK_NAME = "klaatu_thumbnail_prefetch"
         private const val KEY_URLS = "urls"
+        private const val KEY_ARTICLE_IDS = "article_ids"
+        private const val KEY_ARTICLE_LINKS = "article_links"
         private const val COOLDOWN_MS = 10 * 60 * 1_000L
 
         private val recentAttempts = ConcurrentHashMap<String, Long>()
 
-        fun enqueue(context: Context, urls: List<String>) {
+        fun enqueue(
+            context: Context,
+            urls: List<String>,
+            articlesToScrape: List<Pair<Long, String>> = emptyList(),
+        ) {
             val now = System.currentTimeMillis()
             recentAttempts.entries.removeIf { now - it.value > COOLDOWN_MS }
 
-            val pending = urls.asSequence()
+            val pendingUrls = urls.asSequence()
                 .map { it.trim() }
                 .filter { it.isNotEmpty() }
                 .distinct()
@@ -60,20 +98,37 @@ class ThumbnailPrefetchWorker(
                 .take(30)
                 .toList()
 
-            if (pending.isEmpty()) return
-            pending.forEach { recentAttempts[it] = now }
+            val pendingArticles = articlesToScrape.asSequence()
+                .filter { (_, link) -> link.startsWith("http", ignoreCase = true) }
+                .distinctBy { it.first }
+                .filter { (_, link) ->
+                    val lastAttempt = recentAttempts[link]
+                    lastAttempt == null || (now - lastAttempt) > COOLDOWN_MS
+                }
+                .take(15)
+                .toList()
+
+            if (pendingUrls.isEmpty() && pendingArticles.isEmpty()) return
+            pendingUrls.forEach { recentAttempts[it] = now }
+            pendingArticles.forEach { (_, link) -> recentAttempts[link] = now }
 
             val constraints = Constraints.Builder()
                 .setRequiredNetworkType(NetworkType.CONNECTED)
                 .build()
             val request = OneTimeWorkRequestBuilder<ThumbnailPrefetchWorker>()
                 .setConstraints(constraints)
-                .setInputData(workDataOf(KEY_URLS to pending.toTypedArray()))
+                .setInputData(
+                    workDataOf(
+                        KEY_URLS to pendingUrls.toTypedArray(),
+                        KEY_ARTICLE_IDS to pendingArticles.map { it.first }.toLongArray(),
+                        KEY_ARTICLE_LINKS to pendingArticles.map { it.second }.toTypedArray(),
+                    )
+                )
                 .build()
 
             WorkManager.getInstance(context).enqueueUniqueWork(
                 WORK_NAME,
-                ExistingWorkPolicy.KEEP,
+                ExistingWorkPolicy.APPEND_OR_REPLACE,
                 request,
             )
         }

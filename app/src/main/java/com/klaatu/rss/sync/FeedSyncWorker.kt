@@ -13,6 +13,7 @@ import androidx.work.OutOfQuotaPolicy
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
+import com.klaatu.rss.data.AuditLog
 import com.klaatu.rss.data.FeedRepository
 import com.klaatu.rss.widget.KlaatuWidget
 import com.klaatu.rss.widget.WidgetPreferences
@@ -27,17 +28,22 @@ class FeedSyncWorker(
     override suspend fun doWork(): Result {
         val repo = FeedRepository(applicationContext)
         Log.d("KlaatuSync", "FeedSyncWorker started")
+        AuditLog.info(applicationContext, "WORKER", "FeedSyncWorker started")
         try {
             val synced = withTimeoutOrNull(25_000L) {
                 repo.syncAllFeeds()
             }
             Log.d("KlaatuSync", "FeedSyncWorker finished, synced=$synced")
-            withTimeoutOrNull(10_000L) {
+            if (synced == null) {
+                AuditLog.error(applicationContext, "WORKER", "FeedSyncWorker timed out at 25s")
+            }
+            val thumbs = withTimeoutOrNull(10_000L) {
                 repo.prefetchRecentThumbnails()
             }
+            AuditLog.info(applicationContext, "THUMBS", "Sync prefetch cached ${thumbs ?: 0} thumbnails")
         } finally {
             WidgetPreferences.clearAllRefreshing(applicationContext)
-            KlaatuWidget().updateAll(applicationContext)
+            KlaatuWidget.updateAllSequential(applicationContext)
         }
         return Result.success()
     }

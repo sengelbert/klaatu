@@ -4,7 +4,6 @@ import android.appwidget.AppWidgetManager
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
-import android.graphics.drawable.BitmapDrawable
 import android.net.Uri
 import android.text.format.DateUtils
 import android.util.Log
@@ -46,18 +45,12 @@ import androidx.glance.layout.width
 import androidx.glance.text.FontWeight
 import androidx.glance.text.Text
 import androidx.glance.text.TextStyle
-import coil.imageLoader
-import coil.request.CachePolicy
-import coil.request.ImageRequest
-import coil.request.SuccessResult
+import com.klaatu.rss.MainActivity
 import com.klaatu.rss.R
+import com.klaatu.rss.data.AuditLog
 import com.klaatu.rss.data.FeedRepository
 import com.klaatu.rss.sync.FeedSyncWorker
 import com.klaatu.rss.sync.ThumbnailPrefetchWorker
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.withTimeoutOrNull
 
 data class WidgetArticleUi(
     val id: Long,
@@ -91,19 +84,29 @@ class KlaatuWidget : GlanceAppWidget() {
         val repo = FeedRepository(context)
 
         val totalCount = repo.getWidgetArticleCount(config.categories, config.feedIds)
-        val rawArticles = repo.getWidgetArticles(config.categories, config.feedIds, limit = 30)
-        val thumbnails = loadCachedThumbnails(
-            context = context,
-            items = rawArticles.map { it.id to it.imageUrl },
+        val rawArticles = repo.getWidgetArticles(config.categories, config.feedIds, limit = 25)
+        val thumbnails = rawArticles.associate { article ->
+            article.id to WidgetThumbnailStore.loadBitmapIfCached(context, article.imageUrl)
+        }
+
+        val cachedCount = thumbnails.values.count { it != null }
+        val label = config.categories.ifEmpty { setOf("All") }.joinToString("+")
+        AuditLog.info(
+            context,
+            "WIDGET",
+            "#$appWidgetId ($label): $cachedCount/${rawArticles.size} thumbs cached",
         )
 
         if (!isRefreshing) {
-            val missingUrls = rawArticles.take(25)
-                .filter { it.id !in thumbnails && !it.imageUrl.isNullOrBlank() }
+            val missingUrls = rawArticles
+                .filter { thumbnails[it.id] == null && !it.imageUrl.isNullOrBlank() }
                 .mapNotNull { it.imageUrl }
                 .distinct()
-            if (missingUrls.isNotEmpty()) {
-                ThumbnailPrefetchWorker.enqueue(context, missingUrls)
+            val missingArticles = rawArticles
+                .filter { thumbnails[it.id] == null && it.imageUrl.isNullOrBlank() }
+                .map { it.id to it.link }
+            if (missingUrls.isNotEmpty() || missingArticles.isNotEmpty()) {
+                ThumbnailPrefetchWorker.enqueue(context, missingUrls, missingArticles)
             }
         }
 
@@ -132,6 +135,11 @@ class KlaatuWidget : GlanceAppWidget() {
         }
 
         val subtitle = config.resolveSubtitle(totalCount)
+        val openAppIntent = Intent(context, MainActivity::class.java).apply {
+            data = Uri.parse("klaatu://open/$appWidgetId")
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+            putExtra(MainActivity.EXTRA_INITIAL_CATEGORY, config.categories.firstOrNull())
+        }
         val configIntent = Intent(context, WidgetConfigActivity::class.java).apply {
             putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, appWidgetId)
             data = Uri.parse("klaatu://widget/$appWidgetId")
@@ -146,45 +154,12 @@ class KlaatuWidget : GlanceAppWidget() {
                     headerStyle = config.headerStyle,
                     subtitle = subtitle,
                     isRefreshing = isRefreshing,
+                    openAppIntent = openAppIntent,
                     configIntent = configIntent,
                     articles = uiArticles,
                 )
             }
         }
-    }
-
-    /**
-     * Reads already-cached thumbnails from Coil's memory/disk cache without network I/O
-     * so widget updates (config saves, refresh spinner toggles) complete immediately and
-     * never discard existing thumbnails.
-     */
-    private suspend fun loadCachedThumbnails(
-        context: Context,
-        items: List<Pair<Long, String?>>,
-    ): Map<Long, Bitmap> = coroutineScope {
-        val imageLoader = context.imageLoader
-        items.take(25)
-            .filter { !it.second.isNullOrBlank() }
-            .map { (id, url) ->
-                async {
-                    val bitmap = withTimeoutOrNull(800L) {
-                        runCatching {
-                            val request = ImageRequest.Builder(context)
-                                .data(url)
-                                .size(264, 180)
-                                .allowHardware(false)
-                                .networkCachePolicy(CachePolicy.DISABLED)
-                                .build()
-                            val result = imageLoader.execute(request) as? SuccessResult
-                            (result?.drawable as? BitmapDrawable)?.bitmap
-                        }.getOrNull()
-                    }
-                    if (bitmap != null) id to bitmap else null
-                }
-            }
-            .awaitAll()
-            .filterNotNull()
-            .toMap()
     }
 
     private fun formatRelativeTime(publishedAt: Long): String {
@@ -196,6 +171,20 @@ class KlaatuWidget : GlanceAppWidget() {
             DateUtils.FORMAT_ABBREV_RELATIVE,
         ).toString()
     }
+
+    companion object {
+        /**
+         * Updates widgets one by one so multiple widgets with thumbnails don't flood
+         * Android's shared Binder transaction buffer simultaneously.
+         */
+        suspend fun updateAllSequential(context: Context) {
+            val manager = GlanceAppWidgetManager(context)
+            val widget = KlaatuWidget()
+            for (glanceId in manager.getGlanceIds(KlaatuWidget::class.java)) {
+                widget.update(context, glanceId)
+            }
+        }
+    }
 }
 
 @Composable
@@ -205,6 +194,7 @@ private fun KlaatuWidgetContent(
     headerStyle: WidgetHeaderStyle,
     subtitle: String,
     isRefreshing: Boolean,
+    openAppIntent: Intent,
     configIntent: Intent,
     articles: List<WidgetArticleUi>,
 ) {
@@ -231,31 +221,38 @@ private fun KlaatuWidgetContent(
                 .padding(horizontal = 12.dp, vertical = 10.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Image(
-                provider = ImageProvider(R.drawable.ic_gort),
-                contentDescription = "Klaatu",
-                colorFilter = ColorFilter.tint(headerTitleColor),
-                modifier = GlanceModifier.size(22.dp),
-            )
-            Spacer(modifier = GlanceModifier.width(10.dp))
-            Column(modifier = GlanceModifier.defaultWeight()) {
-                Text(
-                    text = "Klaatu",
-                    maxLines = 1,
-                    style = TextStyle(
-                        color = headerTitleColor,
-                        fontSize = 15.sp,
-                        fontWeight = FontWeight.Bold,
-                    ),
+            Row(
+                modifier = GlanceModifier
+                    .defaultWeight()
+                    .clickable(actionStartActivity(openAppIntent)),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Image(
+                    provider = ImageProvider(R.drawable.ic_gort),
+                    contentDescription = "Klaatu",
+                    colorFilter = ColorFilter.tint(headerTitleColor),
+                    modifier = GlanceModifier.size(22.dp),
                 )
-                Text(
-                    text = subtitle,
-                    maxLines = 1,
-                    style = TextStyle(
-                        color = headerSubtitleColor,
-                        fontSize = 12.sp,
-                    ),
-                )
+                Spacer(modifier = GlanceModifier.width(10.dp))
+                Column(modifier = GlanceModifier.defaultWeight()) {
+                    Text(
+                        text = "Klaatu",
+                        maxLines = 1,
+                        style = TextStyle(
+                            color = headerTitleColor,
+                            fontSize = 15.sp,
+                            fontWeight = FontWeight.Bold,
+                        ),
+                    )
+                    Text(
+                        text = subtitle,
+                        maxLines = 1,
+                        style = TextStyle(
+                            color = headerSubtitleColor,
+                            fontSize = 12.sp,
+                        ),
+                    )
+                }
             }
             if (isRefreshing) {
                 Box(

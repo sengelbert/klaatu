@@ -11,9 +11,11 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
@@ -35,6 +37,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CreateNewFolder
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Download
@@ -70,6 +73,7 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -84,11 +88,16 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.glance.appwidget.updateAll
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import coil.compose.AsyncImage
+import com.klaatu.rss.data.AuditEntry
+import com.klaatu.rss.data.AuditLevel
+import com.klaatu.rss.data.AuditLog
 import com.klaatu.rss.data.FeedRepository
 import com.klaatu.rss.data.db.ArticleWithFeed
 import com.klaatu.rss.data.db.FeedEntity
@@ -101,7 +110,12 @@ import com.klaatu.rss.widget.WidgetConfig
 import com.klaatu.rss.widget.WidgetConfigActivity
 import com.klaatu.rss.widget.WidgetPreferences
 import com.klaatu.rss.widget.WidgetThemeMode
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 private enum class AppTab {
     FEED,
@@ -109,21 +123,49 @@ private enum class AppTab {
 }
 
 class MainActivity : ComponentActivity() {
+
+    private var pendingCategory by mutableStateOf<String?>(null)
+    private var launchCounter by mutableStateOf(0)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         FeedSyncWorker.schedulePeriodic(this)
+        handleLaunchIntent(intent)
         setContent {
             KlaatuTheme {
-                KlaatuCompanionScreen()
+                KlaatuCompanionScreen(
+                    initialCategory = pendingCategory,
+                    launchCounter = launchCounter,
+                )
             }
         }
     }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleLaunchIntent(intent)
+    }
+
+    private fun handleLaunchIntent(intent: Intent?) {
+        if (intent?.hasExtra(EXTRA_INITIAL_CATEGORY) == true) {
+            pendingCategory = intent.getStringExtra(EXTRA_INITIAL_CATEGORY)
+            launchCounter++
+        }
+    }
+
+    companion object {
+        const val EXTRA_INITIAL_CATEGORY = "extra_initial_category"
+    }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
-private fun KlaatuCompanionScreen() {
+private fun KlaatuCompanionScreen(
+    initialCategory: String? = null,
+    launchCounter: Int = 0,
+) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val repo = remember { FeedRepository(context) }
@@ -133,9 +175,17 @@ private fun KlaatuCompanionScreen() {
     val feeds by repo.observeFeeds().collectAsState(initial = emptyList())
     val categories by repo.observeCategories().collectAsState(initial = emptyList())
     val articleCount by repo.observeTotalArticleCount().collectAsState(initial = 0)
+    val latestArticleTimes by repo.observeFeedLatestArticleMap().collectAsState(initial = emptyMap())
 
     var currentTab by remember { mutableStateOf(AppTab.FEED) }
-    var selectedFeedCategory by remember { mutableStateOf<String?>(null) }
+    var selectedFeedCategory by remember { mutableStateOf(initialCategory) }
+
+    LaunchedEffect(launchCounter) {
+        if (launchCounter > 0) {
+            currentTab = AppTab.FEED
+            selectedFeedCategory = initialCategory
+        }
+    }
     val articles by remember(selectedFeedCategory) {
         repo.observeArticles(selectedFeedCategory)
     }.collectAsState(initial = emptyList())
@@ -144,6 +194,7 @@ private fun KlaatuCompanionScreen() {
     var refreshMinutes by remember { mutableStateOf(WidgetPreferences.getRefreshIntervalMinutes(context)) }
     var isSubscriptionsExpanded by remember { mutableStateOf(false) }
     var showAddFeedDialog by remember { mutableStateOf(false) }
+    var showAuditLog by remember { mutableStateOf(false) }
     var isSyncing by remember { mutableStateOf(false) }
 
     DisposableEffect(lifecycleOwner) {
@@ -159,7 +210,7 @@ private fun KlaatuCompanionScreen() {
     val prefetchAndRefreshWidget: () -> Unit = {
         scope.launch {
             if (repo.prefetchRecentThumbnails() > 0) {
-                KlaatuWidget().updateAll(context)
+                KlaatuWidget.updateAllSequential(context)
             }
         }
     }
@@ -169,7 +220,7 @@ private fun KlaatuCompanionScreen() {
             scope.launch {
                 isSyncing = true
                 val synced = repo.syncAllFeeds()
-                KlaatuWidget().updateAll(context)
+                KlaatuWidget.updateAllSequential(context)
                 isSyncing = false
                 prefetchAndRefreshWidget()
                 snackbarHostState.showSnackbar("Synced $synced feeds")
@@ -187,7 +238,7 @@ private fun KlaatuCompanionScreen() {
             } ?: 0
             isSyncing = true
             repo.syncAllFeeds()
-            KlaatuWidget().updateAll(context)
+            KlaatuWidget.updateAllSequential(context)
             isSyncing = false
             prefetchAndRefreshWidget()
             snackbarHostState.showSnackbar("Imported $imported feeds")
@@ -212,7 +263,12 @@ private fun KlaatuCompanionScreen() {
         topBar = {
             TopAppBar(
                 title = {
-                    Column {
+                    Column(
+                        modifier = Modifier.combinedClickable(
+                            onClick = {},
+                            onLongClick = { showAuditLog = true },
+                        ),
+                    ) {
                         Text("Klaatu", fontWeight = FontWeight.Bold)
                         Text(
                             "${feeds.size} feeds · $articleCount articles",
@@ -277,6 +333,7 @@ private fun KlaatuCompanionScreen() {
                 ManageTab(
                     modifier = Modifier.padding(innerPadding),
                     feeds = feeds,
+                    latestArticleTimes = latestArticleTimes,
                     activeWidgets = activeWidgets,
                     refreshMinutes = refreshMinutes,
                     isSubscriptionsExpanded = isSubscriptionsExpanded,
@@ -297,21 +354,28 @@ private fun KlaatuCompanionScreen() {
                     onDeleteFeed = { feedId ->
                         scope.launch {
                             repo.deleteFeed(feedId)
-                            KlaatuWidget().updateAll(context)
+                            KlaatuWidget.updateAllSequential(context)
                         }
                     },
                     onDeleteCategory = { category ->
                         scope.launch {
                             repo.deleteFeedsByCategory(category)
-                            KlaatuWidget().updateAll(context)
+                            KlaatuWidget.updateAllSequential(context)
                             snackbarHostState.showSnackbar("Removed feeds in $category")
                         }
                     },
                     onDeleteBroken = {
                         scope.launch {
                             repo.deleteBrokenFeeds()
-                            KlaatuWidget().updateAll(context)
+                            KlaatuWidget.updateAllSequential(context)
                             snackbarHostState.showSnackbar("Removed broken feeds")
+                        }
+                    },
+                    onDeleteStale = { staleIds ->
+                        scope.launch {
+                            repo.deleteFeedsByIds(staleIds)
+                            KlaatuWidget.updateAllSequential(context)
+                            snackbarHostState.showSnackbar("Removed ${staleIds.size} stale feed(s)")
                         }
                     },
                 )
@@ -330,7 +394,7 @@ private fun KlaatuCompanionScreen() {
                     if (added) {
                         isSyncing = true
                         repo.syncAllFeeds()
-                        KlaatuWidget().updateAll(context)
+                        KlaatuWidget.updateAllSequential(context)
                         isSyncing = false
                         prefetchAndRefreshWidget()
                         snackbarHostState.showSnackbar("Feed added")
@@ -340,6 +404,10 @@ private fun KlaatuCompanionScreen() {
                 }
             },
         )
+    }
+
+    if (showAuditLog) {
+        AuditLogDialog(onDismiss = { showAuditLog = false })
     }
 }
 
@@ -505,10 +573,13 @@ private fun formatRelativeTime(publishedAt: Long): String {
     ).toString()
 }
 
+private const val STALE_THRESHOLD_MS = 90L * 24 * 60 * 60 * 1_000L
+
 @Composable
 private fun ManageTab(
     modifier: Modifier = Modifier,
     feeds: List<FeedEntity>,
+    latestArticleTimes: Map<Long, Long>,
     activeWidgets: List<WidgetConfig>,
     refreshMinutes: Long,
     isSubscriptionsExpanded: Boolean,
@@ -520,11 +591,14 @@ private fun ManageTab(
     onDeleteFeed: (Long) -> Unit,
     onDeleteCategory: (String) -> Unit,
     onDeleteBroken: () -> Unit,
+    onDeleteStale: (List<Long>) -> Unit,
 ) {
     var selectedCategory by remember { mutableStateOf<String?>(null) }
     var showBrokenOnly by remember { mutableStateOf(false) }
+    var showStaleOnly by remember { mutableStateOf(false) }
     var categoryPendingDelete by remember { mutableStateOf<String?>(null) }
     var confirmDeleteBroken by remember { mutableStateOf(false) }
+    var confirmDeleteStale by remember { mutableStateOf(false) }
 
     val categoryCounts = remember(feeds) {
         feeds.groupingBy { it.category }.eachCount()
@@ -532,14 +606,25 @@ private fun ManageTab(
     val brokenCount = remember(feeds) {
         feeds.count { it.lastError.isNotEmpty() }
     }
+    val staleFeedIds = remember(feeds, latestArticleTimes) {
+        val cutoff = System.currentTimeMillis() - STALE_THRESHOLD_MS
+        feeds.filter { feed ->
+            if (feed.lastFetchedAt <= 0L || feed.lastError.isNotEmpty()) return@filter false
+            val latest = latestArticleTimes[feed.id]
+            latest == null || latest < cutoff
+        }.map { it.id }.toSet()
+    }
+    val staleCount = staleFeedIds.size
     val sortedCategories = remember(categoryCounts) {
         categoryCounts.keys.sorted()
     }
     val activeBrokenFilter = showBrokenOnly && brokenCount > 0
-    val activeCategory = if (activeBrokenFilter) null else selectedCategory?.takeIf { it in categoryCounts }
-    val filteredFeeds = remember(feeds, activeCategory, activeBrokenFilter) {
+    val activeStaleFilter = !activeBrokenFilter && showStaleOnly && staleCount > 0
+    val activeCategory = if (activeBrokenFilter || activeStaleFilter) null else selectedCategory?.takeIf { it in categoryCounts }
+    val filteredFeeds = remember(feeds, activeCategory, activeBrokenFilter, activeStaleFilter, staleFeedIds) {
         when {
             activeBrokenFilter -> feeds.filter { it.lastError.isNotEmpty() }
+            activeStaleFilter -> feeds.filter { it.id in staleFeedIds }
             activeCategory != null -> feeds.filter { it.category == activeCategory }
             else -> feeds
         }
@@ -649,9 +734,10 @@ private fun ManageTab(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     FilterChip(
-                        selected = !activeBrokenFilter && activeCategory == null,
+                        selected = !activeBrokenFilter && !activeStaleFilter && activeCategory == null,
                         onClick = {
                             showBrokenOnly = false
+                            showStaleOnly = false
                             selectedCategory = null
                         },
                         label = { Text("All (${feeds.size})") },
@@ -661,16 +747,33 @@ private fun ManageTab(
                             selected = activeBrokenFilter,
                             onClick = {
                                 showBrokenOnly = !activeBrokenFilter
-                                if (showBrokenOnly) selectedCategory = null
+                                if (showBrokenOnly) {
+                                    showStaleOnly = false
+                                    selectedCategory = null
+                                }
                             },
                             label = { Text("Broken ($brokenCount)") },
                         )
                     }
+                    if (staleCount > 0) {
+                        FilterChip(
+                            selected = activeStaleFilter,
+                            onClick = {
+                                showStaleOnly = !activeStaleFilter
+                                if (showStaleOnly) {
+                                    showBrokenOnly = false
+                                    selectedCategory = null
+                                }
+                            },
+                            label = { Text("Stale ($staleCount)") },
+                        )
+                    }
                     sortedCategories.forEach { category ->
                         FilterChip(
-                            selected = !activeBrokenFilter && activeCategory == category,
+                            selected = !activeBrokenFilter && !activeStaleFilter && activeCategory == category,
                             onClick = {
                                 showBrokenOnly = false
+                                showStaleOnly = false
                                 selectedCategory = if (activeCategory == category) null else category
                             },
                             label = { Text("$category (${categoryCounts[category] ?: 0})") },
@@ -694,6 +797,26 @@ private fun ManageTab(
                         TextButton(onClick = { confirmDeleteBroken = true }) {
                             Text(
                                 text = "Delete all broken",
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                        }
+                    }
+                }
+            } else if (activeStaleFilter) {
+                item {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = "$staleCount stale feed(s) (90+ days inactive)",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.weight(1f),
+                        )
+                        TextButton(onClick = { confirmDeleteStale = true }) {
+                            Text(
+                                text = "Delete all stale",
                                 color = MaterialTheme.colorScheme.error,
                             )
                         }
@@ -724,6 +847,8 @@ private fun ManageTab(
             items(filteredFeeds, key = { it.id }) { feed ->
                 FeedRow(
                     feed = feed,
+                    isStale = feed.id in staleFeedIds,
+                    latestPublishedAt = latestArticleTimes[feed.id],
                     onDelete = { onDeleteFeed(feed.id) },
                 )
             }
@@ -780,6 +905,32 @@ private fun ManageTab(
             },
             dismissButton = {
                 TextButton(onClick = { confirmDeleteBroken = false }) {
+                    Text("Cancel")
+                }
+            },
+        )
+    }
+
+    if (confirmDeleteStale) {
+        AlertDialog(
+            onDismissRequest = { confirmDeleteStale = false },
+            title = { Text("Delete stale feeds?") },
+            text = {
+                Text("Remove all $staleCount feed(s) with no new posts in the last 90 days?")
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        confirmDeleteStale = false
+                        showStaleOnly = false
+                        onDeleteStale(staleFeedIds.toList())
+                    },
+                ) {
+                    Text("Delete", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmDeleteStale = false }) {
                     Text("Cancel")
                 }
             },
@@ -897,6 +1048,8 @@ private fun WidgetConfigRow(
 @Composable
 private fun FeedRow(
     feed: FeedEntity,
+    isStale: Boolean = false,
+    latestPublishedAt: Long? = null,
     onDelete: () -> Unit,
 ) {
     Row(
@@ -924,6 +1077,19 @@ private fun FeedRow(
                     text = "Failed: ${feed.lastError}",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.error,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            } else if (isStale) {
+                val detail = if (latestPublishedAt != null) {
+                    "Last post: ${formatRelativeTime(latestPublishedAt)}"
+                } else {
+                    "No articles found"
+                }
+                Text(
+                    text = "Stale ($detail)",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
@@ -1051,4 +1217,160 @@ private fun AddFeedDialog(
             }
         },
     )
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun AuditLogDialog(onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var entries by remember { mutableStateOf<List<AuditEntry>>(emptyList()) }
+    var filter by remember { mutableStateOf("ALL") }
+
+    suspend fun reload() {
+        entries = withContext(Dispatchers.IO) { AuditLog.readAll(context) }
+    }
+
+    LaunchedEffect(Unit) { reload() }
+
+    val filtered = remember(entries, filter) {
+        when (filter) {
+            "ERR" -> entries.filter { it.level == AuditLevel.ERROR }
+            "SYNC" -> entries.filter { it.category == "SYNC" || it.category == "WORKER" }
+            "THUMBS" -> entries.filter { it.category == "THUMBS" }
+            "WIDGET" -> entries.filter { it.category == "WIDGET" }
+            else -> entries
+        }
+    }
+    val timeFormatter = remember { SimpleDateFormat("MM-dd HH:mm:ss", Locale.getDefault()) }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        Scaffold(
+            topBar = {
+                TopAppBar(
+                    title = {
+                        Column {
+                            Text("Audit Log", fontWeight = FontWeight.Bold)
+                            Text(
+                                "${filtered.size} / ${entries.size} entries",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    },
+                    navigationIcon = {
+                        IconButton(onClick = onDismiss) {
+                            Icon(Icons.Default.Close, contentDescription = "Close audit log")
+                        }
+                    },
+                    actions = {
+                        IconButton(onClick = { scope.launch { reload() } }) {
+                            Icon(Icons.Default.Refresh, contentDescription = "Reload log")
+                        }
+                        TextButton(
+                            onClick = {
+                                scope.launch {
+                                    withContext(Dispatchers.IO) { AuditLog.clear(context) }
+                                    entries = emptyList()
+                                }
+                            },
+                        ) {
+                            Text("Clear")
+                        }
+                    },
+                )
+            },
+        ) { innerPadding ->
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(innerPadding)
+                    .padding(horizontal = 12.dp),
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    listOf(
+                        "ALL" to "All",
+                        "ERR" to "Errors",
+                        "SYNC" to "Sync",
+                        "THUMBS" to "Thumbs",
+                        "WIDGET" to "Widgets",
+                    ).forEach { (key, label) ->
+                        FilterChip(
+                            selected = filter == key,
+                            onClick = { filter = key },
+                            label = { Text(label) },
+                        )
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
+                if (filtered.isEmpty()) {
+                    Box(
+                        modifier = Modifier.fillMaxSize(),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            "No log entries yet.",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                } else {
+                    LazyColumn(
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                        contentPadding = PaddingValues(bottom = 16.dp),
+                    ) {
+                        items(filtered) { entry ->
+                            val badgeColor = when (entry.level) {
+                                AuditLevel.ERROR -> MaterialTheme.colorScheme.error
+                                AuditLevel.SUCCESS -> MaterialTheme.colorScheme.primary
+                                AuditLevel.INFO -> MaterialTheme.colorScheme.onSurfaceVariant
+                            }
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f))
+                                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                            ) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                ) {
+                                    Text(
+                                        text = entry.level.name,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontWeight = FontWeight.Bold,
+                                        color = badgeColor,
+                                    )
+                                    Text(
+                                        text = entry.category,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                    Spacer(Modifier.weight(1f))
+                                    Text(
+                                        text = timeFormatter.format(Date(entry.timestamp)),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                                Text(
+                                    text = entry.message,
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
